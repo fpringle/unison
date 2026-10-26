@@ -203,8 +203,6 @@ handleLookupResult = \case
     debug (T.unpack err)
     pure $ Left eNOENT
 
--- main
-
 getRoot0 ::
   (MonadIO m) =>
   Codebase m Symbol Ann ->
@@ -216,6 +214,8 @@ getRoot0 codebase root = do
   declTypeCache <- Cache.semispaceCache 2048
   let getDeclType = CodebaseOps.makeCachedTransaction declTypeCache CodebaseOps.getDeclType
   runTransaction codebase $ branch2to1 branchCache getDeclType =<< V2Causal.value root
+
+-- main
 
 -- | Construct a FuseOperations object. This contains all the FUSE operations we support, and
 -- will be passed to the libfuse3 library.

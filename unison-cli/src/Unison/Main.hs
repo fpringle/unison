@@ -56,7 +56,7 @@ import Unison.Auth.CredentialManager qualified as AuthN
 import Unison.Auth.HTTPClient qualified as AuthN
 import Unison.Auth.Tokens qualified as AuthN
 import Unison.Cli.ProjectUtils qualified as ProjectUtils
-import Unison.Codebase (Codebase, CodebasePath)
+import Unison.Codebase (Codebase, CodebasePath, getShallowProjectRootByNames)
 import Unison.Codebase qualified as Codebase
 import Unison.Codebase.Editor.Input qualified as Input
 import Unison.Codebase.Editor.UCMVersion (UCMVersion)
@@ -78,6 +78,7 @@ import Unison.CommandLine.Types qualified as CommandLine
 import Unison.CommandLine.Welcome (CodebaseInitStatus (..))
 import Unison.CommandLine.Welcome qualified as Welcome
 import Unison.Core.Project (ProjectAndBranch (..), ProjectName (..))
+import Unison.FUSE
 import Unison.Hashing.V2 qualified as ABT
 import Unison.LSP qualified as LSP
 import Unison.LSP.Util.Signal qualified as Signal
@@ -321,6 +322,21 @@ main version = do
           case mrtsStatsFp of
             Nothing -> action
             Just fp -> recordRtsStats fp action
+        Mount project mountPoint -> do
+          getCodebaseOrExit mCodePathOption SC.DontLock (SC.MigrateAfterPrompt SC.Backup SC.Vacuum) \(_initRes, _, theCodebase) -> do
+            projectRoot <- do
+              Codebase.runTransaction theCodebase (getShallowProjectRootByNames project) >>= \case
+                Nothing -> do
+                  PT.putPrettyLn $
+                    P.callout
+                      "❓"
+                      ( P.lines
+                          [ P.indentN 2 "I couldn't find the project root: " <> P.text (into @Text project)
+                          ]
+                      )
+                  System.exitFailure
+                Just root -> pure root
+            fuseMain progName theCodebase project projectRoot mountPoint
         Launch isHeadless codebaseServerOpts mayStartingProject shouldWatchFiles -> do
           lockOption <- getCodebaseLockOption
           getCodebaseOrExit mCodePathOption lockOption (SC.MigrateAfterPrompt SC.Backup SC.Vacuum) \(initRes, _, theCodebase) -> do

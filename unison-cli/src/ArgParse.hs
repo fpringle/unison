@@ -124,6 +124,7 @@ data Command
     Init
   | Run RunSource [String]
   | Transcript TranscriptCodebaseSetup (Maybe RtsStatsPath) (NonEmpty FilePath)
+  | Mount (ProjectAndBranch ProjectName ProjectBranchName) FilePath
   deriving (Show, Eq)
 
 -- | Options shared by sufficiently many subcommands.
@@ -246,6 +247,17 @@ transcriptCommand =
           "Multiple transcript files may be provided; they are processed in sequence" <+> "starting from the same codebase."
         ]
 
+mountCommand :: Mod CommandFields Command
+mountCommand =
+  command "mount" (info mountParser (fullDesc <> progDesc mountHelp <> footerDoc mountFooter))
+  where
+    mountHelp = "Mount a namespace as a FUSE filesystem"
+    mountFooter =
+      Just . fold . List.intersperse P.line $
+        [ "The namespace will be mounted as a virtual filesystem at DIR.",
+          "Sub-namespaces will be mounted as sub-directories, while types and terms will" <+> "be mounted as files with a `.u` extension."
+        ]
+
 transcriptForkCommand :: Mod CommandFields Command
 transcriptForkCommand =
   command "transcript.fork" (info transcriptForkParser (fullDesc <> progDesc transcriptHelp <> footerDoc transcriptFooter))
@@ -284,6 +296,7 @@ commandParser envOpts =
           runFileCommand,
           runPipeCommand,
           transcriptCommand,
+          mountCommand,
           transcriptForkCommand,
           transcriptInPlaceCommand,
           launchHeadlessCommand envOpts
@@ -407,7 +420,7 @@ launchParser :: CodebaseServerOpts -> IsHeadless -> Parser Command
 launchParser envOpts isHeadless = do
   -- ApplicativeDo
   codebaseServerOpts <- codebaseServerOptsParser envOpts
-  startingProject <- startingProjectOption
+  startingProject <- optional startingProjectOption
   shouldWatchFiles <- noFileWatchFlag
   pure (Launch isHeadless codebaseServerOpts startingProject shouldWatchFiles)
 
@@ -479,7 +492,7 @@ saveCodebaseToFlag = do
         _ -> DontSaveCodebase
     )
 
-startingProjectOption :: Parser (Maybe (ProjectAndBranch ProjectName ProjectBranchName))
+startingProjectOption :: Parser (ProjectAndBranch ProjectName ProjectBranchName)
 startingProjectOption =
   let meta =
         metavar "project/branch"
@@ -487,7 +500,7 @@ startingProjectOption =
           <> short 'p'
           <> help "Launch the UCM session at the provided project and branch."
           <> noGlobal
-   in optional (option readProjectAndBranchNames meta)
+   in option readProjectAndBranchNames meta
 
 noFileWatchFlag :: Parser ShouldWatchFiles
 noFileWatchFlag =
@@ -532,6 +545,13 @@ fileArgument varName =
         <> action "file" -- Autocomplete file names
     )
 
+directoryArgument :: String -> Parser FilePath
+directoryArgument varName =
+  strArgument
+    ( metavar varName
+        <> action "directory" -- Autocomplete directory names
+    )
+
 transcriptParser :: Parser Command
 transcriptParser = do
   -- ApplicativeDo
@@ -545,6 +565,12 @@ transcriptParser = do
             _ -> shouldSaveCodebaseTo
        in Transcript (UseTempCodebase DontFork saveCodebase) mrtsStatsFp files
     )
+
+mountParser :: Parser Command
+mountParser = do
+  startingProject <- startingProjectOption
+  mountPoint <- directoryArgument "DIR"
+  pure (Mount startingProject mountPoint)
 
 transcriptForkParser :: Parser Command
 transcriptForkParser = do
