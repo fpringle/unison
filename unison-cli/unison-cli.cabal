@@ -133,6 +133,7 @@ library
       Unison.CommandLine.OutputMessages
       Unison.CommandLine.Types
       Unison.CommandLine.Welcome
+      Unison.FUSE
       Unison.LSP
       Unison.LSP.CancelRequest
       Unison.LSP.CodeAction
@@ -232,6 +233,7 @@ library
     , attoparsec
     , base
     , bytestring
+    , clock
     , cmark
     , co-log-core
     , code-page
@@ -258,11 +260,13 @@ library
     , http-types
     , ki
     , lens
+    , libfuse3
     , lsp >=2.2.0.0
     , lsp-types >=2.0.2.0
     , megaparsec
     , memory
     , mtl
+    , murmur-hash
     , network
     , network-simple
     , network-uri
@@ -308,6 +312,7 @@ library
     , unison-sqlite
     , unison-syntax
     , unison-util-base32hex
+    , unison-util-cache
     , unison-util-diff3
     , unison-util-file-embed
     , unison-util-recursion

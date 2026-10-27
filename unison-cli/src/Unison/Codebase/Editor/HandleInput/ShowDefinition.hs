@@ -2,6 +2,7 @@ module Unison.Codebase.Editor.HandleInput.ShowDefinition
   ( handleShowDefinition,
     showDefinitions,
     renderToFile,
+    renderCodePretty,
   )
 where
 

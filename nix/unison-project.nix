@@ -55,6 +55,7 @@ in
       pkgs.jq # helpful when pushing to Cachix
       pkgs.ormolu
       pkgs.stack-wrapped
+      pkgs.fuse3
     ];
     devShellArgsModifier = args: args // {withHoogle = true;};
   }
