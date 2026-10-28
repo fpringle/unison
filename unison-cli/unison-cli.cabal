@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.39.6.
+-- This file has been generated from package.yaml by hpack version 0.38.3.
 --
 -- see: https://github.com/sol/hpack
 
@@ -312,7 +312,6 @@ library
     , unison-sqlite
     , unison-syntax
     , unison-util-base32hex
-    , unison-util-cache
     , unison-util-diff3
     , unison-util-file-embed
     , unison-util-recursion

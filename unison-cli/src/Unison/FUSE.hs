@@ -17,19 +17,24 @@ import U.Codebase.Branch (CausalBranch)
 import U.Codebase.Causal qualified as V2Causal
 import U.Codebase.HashTags (CausalHash (..))
 import U.Codebase.Reference (Id' (..), Reference' (..))
+import U.Codebase.Sqlite.DbId (ProjectBranchId, ProjectId)
+import U.Codebase.Sqlite.Operations (expectCausalBranchByCausalHash)
+import U.Codebase.Sqlite.Project (Project)
+import U.Codebase.Sqlite.ProjectBranch (ProjectBranch)
+import U.Codebase.Sqlite.Queries (expectCausalHash, expectProjectBranchHead)
 import Unison.Cli.Pretty (prettyProjectAndBranchName)
+import Unison.Cli.ProjectUtils (justTheIds, justTheNames)
 import Unison.Codebase
   ( Codebase,
+    expectProjectBranchRoot,
+    getShallowBranchAtPath,
     getShallowCausalAtPath,
     runTransaction,
   )
-import Unison.Codebase.Branch (Branch0)
 import Unison.Codebase.Branch.Names qualified as Branch
+import Unison.Codebase.Branch.Type qualified as Branch
 import Unison.Codebase.Editor.HandleInput.ShowDefinition (renderCodePretty)
 import Unison.Codebase.Path (Path, fromList)
-import Unison.Codebase.SqliteCodebase.Branch.Cache (newBranchCache)
-import Unison.Codebase.SqliteCodebase.Conversions (branch2to1)
-import Unison.Codebase.SqliteCodebase.Operations qualified as CodebaseOps
 import Unison.CommandLine.OutputMessages (renderFileName)
 import Unison.ConstructorReference (GConstructorReference (..))
 import Unison.Core.Project
@@ -58,7 +63,6 @@ import Unison.Symbol (Symbol)
 import Unison.Syntax.HashQualified qualified as HQ
 import Unison.Syntax.Name qualified as Name (toText)
 import Unison.Syntax.NameSegment qualified as NameSegment
-import Unison.Util.Cache qualified as Cache
 import Unison.Util.Defns (Defns (..))
 import Unison.Util.Pretty qualified as Pretty
 
@@ -147,15 +151,15 @@ makeDirName name = T.unpack $ NameSegment.toEscapedText name
 -- Codebase ops
 
 getFileHandle ::
-  Branch0 Transaction ->
   Codebase IO Symbol Ann ->
+  ProjectAndBranch ProjectId ProjectBranchId ->
   HashQualified Name ->
   IO (LookupResult FileHandle)
-getFileHandle root0 codebase name = do
-  let names = Names.makeAbsolute (Branch.toNames root0)
-      nameSearch = NameSearch.makeNameSearch 10 names
+getFileHandle codebase project name = do
+  names <- Names.makeAbsolute <$> getRootNames codebase project
+  let nameSearch = NameSearch.makeNameSearch 10 names
 
-  QueryResult _ hits0 <- runTransaction codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton name)
+  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch IncludeSuffixes (Set.singleton name)
   let hits = filter ((== name) . SearchResult.name) hits0
 
   case hits of
@@ -171,27 +175,35 @@ getFileHandle root0 codebase name = do
     [] -> pure NotFound
     _many -> pure $ LookupError "Ambiguous search"
 
+-- | Useful for debugging bottlenecks. Un-comment the lines below to print timings.
+runTransactionTimed :: (MonadIO m) => Text -> Codebase m v a -> Transaction b -> m b
+runTransactionTimed _label codebase transaction = do
+  -- start <- liftIO getCurrentTime
+  res <- runTransaction codebase transaction
+  -- end <- liftIO getCurrentTime
+  -- liftIO $ putStrLn $ T.unpack label <> " took " <> show (diffUTCTime end start)
+  pure res
+
 getDirHandle ::
-  CausalBranch Transaction ->
   Codebase IO Symbol Ann ->
+  ProjectAndBranch ProjectId ProjectBranchId ->
   Path ->
   IO (LookupResult DirHandle)
-getDirHandle root codebase path = do
+getDirHandle codebase project path = do
   listingCausal <-
-    runTransaction codebase $ getShallowCausalAtPath path root
+    getRoot codebase project >>= runTransactionTimed "getShallowCausalAtPath" codebase . getShallowCausalAtPath path
   let hash = unCausalHash $ V2Causal.causalHash listingCausal
   pure . Found $ DirHandle hash path
 
 getFileOrDirHandle ::
-  Branch0 Transaction ->
-  CausalBranch Transaction ->
   Codebase IO Symbol Ann ->
+  ProjectAndBranch Project ProjectBranch ->
   FilePath ->
   IO (LookupResult FileOrDirHandle)
-getFileOrDirHandle root0 root codebase fp = case parseFileOrDirName fp of
+getFileOrDirHandle codebase project fp = case parseFileOrDirName fp of
   Left err -> pure $ LookupError err
-  Right (FileName hqName) -> fmap File <$> getFileHandle root0 codebase hqName
-  Right (DirName path) -> fmap Dir <$> getDirHandle root codebase path
+  Right (FileName hqName) -> fmap File <$> getFileHandle codebase (justTheIds project) hqName
+  Right (DirName path) -> fmap Dir <$> getDirHandle codebase (justTheIds project) path
 
 handleLookupResult ::
   LookupResult a ->
@@ -203,17 +215,28 @@ handleLookupResult = \case
     debug (T.unpack err)
     pure $ Left eNOENT
 
-getRoot0 ::
+getShallowProjectRootByIds :: ProjectAndBranch ProjectId ProjectBranchId -> Transaction (CausalBranch Transaction)
+getShallowProjectRootByIds (ProjectAndBranch projectId branchId) = do
+  causalHashId <- expectProjectBranchHead projectId branchId
+  causalHash <- expectCausalHash causalHashId
+  expectCausalBranchByCausalHash causalHash
+
+getRoot ::
   (MonadIO m) =>
   Codebase m Symbol Ann ->
-  -- | Project root
-  CausalBranch Transaction ->
-  m (Branch0 Transaction)
-getRoot0 codebase root = do
-  branchCache <- newBranchCache
-  declTypeCache <- Cache.semispaceCache 2048
-  let getDeclType = CodebaseOps.makeCachedTransaction declTypeCache CodebaseOps.getDeclType
-  runTransaction codebase $ branch2to1 branchCache getDeclType =<< V2Causal.value root
+  ProjectAndBranch ProjectId ProjectBranchId ->
+  m (CausalBranch Transaction)
+getRoot codebase project =
+  runTransactionTimed "getShallowProjectRootByIds" codebase (getShallowProjectRootByIds project)
+
+getRootNames ::
+  (MonadIO m) =>
+  Codebase m Symbol Ann ->
+  ProjectAndBranch ProjectId ProjectBranchId ->
+  m Names.Names
+getRootNames codebase project = do
+  branch <- expectProjectBranchRoot codebase project.project project.branch
+  pure . Branch.toNames . Branch.head $ branch
 
 -- main
 
@@ -221,20 +244,17 @@ getRoot0 codebase root = do
 -- will be passed to the libfuse3 library.
 makeFuseOperations ::
   Codebase IO Symbol Ann ->
-  -- | Project root
-  CausalBranch Transaction ->
+  ProjectAndBranch Project ProjectBranch ->
   IO (FuseOperations FileHandle DirHandle)
-makeFuseOperations codebase root = do
-  root0 <- getRoot0 codebase root
+makeFuseOperations codebase project = do
+  let projectIds = justTheIds project
 
   let readdir :: FilePath -> DirHandle -> IO (Either Errno [(String, Maybe FileStat)])
       readdir fp (DirHandle _hash path) = do
         debug ("readdir " <> fp)
-        listingBranch <-
-          (runTransaction codebase) do
-            listingCausal <- getShallowCausalAtPath path root
-            listingBranch <- V2Causal.value listingCausal
-            pure listingBranch
+        listingBranch <- do
+          root <- getRoot codebase projectIds
+          runTransactionTimed "getShallowBranchAtPath" codebase $ getShallowBranchAtPath path =<< V2Causal.value root
         listingEntries <- lsBranch codebase listingBranch
         pure . Right . mapMaybe makeEntry $ listingEntries
 
@@ -245,7 +265,7 @@ makeFuseOperations codebase root = do
           Left err -> do
             debug (T.unpack $ "Error parsing namespace: " <> err)
             pure $ Left eNOENT
-          Right path -> getDirHandle root codebase path >>= handleLookupResult
+          Right path -> getDirHandle codebase projectIds path >>= handleLookupResult
 
       releasedir :: FilePath -> DirHandle -> IO Errno
       releasedir fp _ = do
@@ -280,7 +300,7 @@ makeFuseOperations codebase root = do
       getattr _ (Just fileHandle) = Right <$> getattr' (File fileHandle)
       getattr fp _ = do
         debug ("getattr " <> fp)
-        getFileOrDirHandle root0 root codebase fp >>= \case
+        getFileOrDirHandle codebase project fp >>= \case
           NotFound -> do
             debug "No such file or directory"
             pure $ Left eNOENT
@@ -300,16 +320,16 @@ makeFuseOperations codebase root = do
             Left err -> do
               debug (T.unpack err)
               pure $ Left eNOENT
-            Right name -> getFileHandle root0 codebase name >>= handleLookupResult
+            Right name -> getFileHandle codebase projectIds name >>= handleLookupResult
 
       read :: FilePath -> FileHandle -> ByteCount -> FileOffset -> IO (Either Errno ByteString)
       read fp (FileHandle _ name) bytes offset = do
         debug ("read " <> fp)
-        let names = Branch.toNames root0
-            absNames = Names.makeAbsolute names
+        names <- getRootNames codebase projectIds
+        let absNames = Names.makeAbsolute names
         Backend.DefinitionResults terms types _misses0 <- do
           let nameSearch = NameSearch.makeNameSearch 10 absNames
-          runTransaction codebase $
+          runTransactionTimed "definitionsByName" codebase $
             Backend.definitionsByName
               codebase
               nameSearch
@@ -343,7 +363,7 @@ makeFuseOperations codebase root = do
       access fp mode = do
         debug ("access " <> fp <> " " <> show mode)
         let checkFile = do
-              lookup <- getFileOrDirHandle root0 root codebase fp >>= handleLookupResult
+              lookup <- getFileOrDirHandle codebase project fp >>= handleLookupResult
               pure $ case lookup of
                 Left err -> err
                 Right _ -> eOK
@@ -391,14 +411,12 @@ fuseMain ::
   -- | Program name
   String ->
   Codebase IO Symbol Ann ->
-  ProjectAndBranch ProjectName ProjectBranchName ->
-  -- | Project root
-  CausalBranch Transaction ->
+  ProjectAndBranch Project ProjectBranch ->
   -- | Mount point
   FilePath ->
   IO ()
-fuseMain progName codebase project root mountPoint = do
-  fuseOps <- makeFuseOperations codebase root
+fuseMain progName codebase project mountPoint = do
+  fuseOps <- makeFuseOperations codebase project
   absMountPoint <- makeAbsolute mountPoint
   prettyMountPoint <- renderFileName absMountPoint
   unlessM (doesDirectoryExist absMountPoint) do
@@ -409,7 +427,7 @@ fuseMain progName codebase project root mountPoint = do
 
   PT.putPrettyLn $
     "Mounting "
-      <> prettyProjectAndBranchName project
+      <> prettyProjectAndBranchName (justTheNames project)
       <> " at "
       <> prettyMountPoint
 
