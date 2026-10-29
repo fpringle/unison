@@ -361,7 +361,7 @@ makeFuseOperations codebase project = do
                   nameSearch
                   DontIncludeCycles
                   ExactName
-                  (Set.singleton (HQ.NameOnly name))
+                  (Set.fromList [HQ.NameOnly name, HQ.NameOnly (Name.snoc name NameSegment.docSegment)])
 
             let unbiasedPPED = PPED.makePPED (PPE.hqNamer 10 names) (PPE.suffixifyByHashName names)
                 pped = PPED.biasTo [name] unbiasedPPED
