@@ -63,13 +63,14 @@ import Unison.Symbol (Symbol)
 import Unison.Syntax.HashQualified qualified as HQ
 import Unison.Syntax.Name qualified as Name (toText)
 import Unison.Syntax.NameSegment qualified as NameSegment
+import Unison.Util.Cache qualified as Cache
 import Unison.Util.Defns (Defns (..))
 import Unison.Util.Pretty qualified as Pretty
 
 -- Types
 
 data TermOrTypeName = BuiltinName (HashQualified Name) | Hash Hash
-  deriving (Show)
+  deriving (Show, Eq, Ord)
 
 data FileHandle = FileHandle TermOrTypeName (HashQualified Name)
   deriving (Show)
@@ -79,6 +80,15 @@ data DirHandle = DirHandle Hash Path
 
 data FileOrDirName = FileName (HashQualified Name) | DirName Path
   deriving (Show)
+
+data FileOrDirHash = BuiltinTermOrType (HashQualified Name) | FileOrDirHash Hash
+  deriving (Show, Eq, Ord)
+
+fileOrDirHash :: FileOrDirHandle -> FileOrDirHash
+fileOrDirHash = \case
+  File (FileHandle (BuiltinName hq) _) -> BuiltinTermOrType hq
+  File (FileHandle (Hash hash) _) -> FileOrDirHash hash
+  Dir (DirHandle hash _) -> FileOrDirHash hash
 
 data FileOrDirHandle
   = File FileHandle
@@ -159,7 +169,7 @@ getFileHandle codebase project name = do
   names <- Names.makeAbsolute <$> getRootNames codebase project
   let nameSearch = NameSearch.makeNameSearch 10 names
 
-  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch IncludeSuffixes (Set.singleton name)
+  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton name)
   let hits = filter ((== name) . SearchResult.name) hits0
 
   case hits of
@@ -249,14 +259,89 @@ makeFuseOperations ::
 makeFuseOperations codebase project = do
   let projectIds = justTheIds project
 
+  listingCache :: Cache.Cache Hash [(String, Maybe FileStat)] <- Cache.semispaceCache 1024
+  let getListing :: DirHandle -> IO [(String, Maybe FileStat)]
+      getListing (DirHandle hash path) =
+        Cache.lookup listingCache hash >>= \case
+          Just v -> pure v
+          Nothing -> do
+            listingBranch <- do
+              root <- getRoot codebase projectIds
+              runTransactionTimed "getShallowBranchAtPath" codebase $ getShallowBranchAtPath path =<< V2Causal.value root
+            listingEntries <- lsBranch codebase listingBranch
+            let entries = mapMaybe makeEntry $ listingEntries
+            Cache.insert listingCache hash entries
+            pure entries
+
+  attrCache :: Cache.Cache FileOrDirHash FileStat <- Cache.semispaceCache 8192
+  let getattr' :: FileOrDirHandle -> IO FileStat
+      getattr' fileOrDir = do
+        let hash = fileOrDirHash fileOrDir
+        Cache.lookup attrCache hash >>= \case
+          Just attr -> pure attr
+          Nothing -> do
+            fileOwner <- getRealUserID
+            fileGroup <- getRealGroupID
+            now <- getTime Realtime
+            let fileID = fileOrDirID fileOrDir
+                (fileOrDirMode, fileSize) = case fileOrDir of
+                  File {} -> (regularFileMode, 0)
+                  Dir {} -> (directoryMode, 4096)
+                fileMode = foldl' unionFileModes fileOrDirMode [ownerReadMode, groupReadMode, otherReadMode]
+                attr =
+                  defaultFileStat
+                    { fileMode,
+                      fileID,
+                      linkCount = 1,
+                      fileOwner,
+                      fileGroup,
+                      fileSize,
+                      accessTimeHiRes = now,
+                      modificationTimeHiRes = now,
+                      statusChangeTimeHiRes = now
+                    }
+            Cache.insert attrCache hash attr
+            pure attr
+
+  readCache :: Cache.Cache TermOrTypeName ByteString <- Cache.semispaceCache 8192
+  let getRendered :: FileHandle -> IO ByteString
+      getRendered (FileHandle termOrTypeName name) =
+        Cache.lookup readCache termOrTypeName >>= \case
+          Just v -> pure v
+          Nothing -> do
+            names <- getRootNames codebase projectIds
+            let absNames = Names.makeAbsolute names
+            Backend.DefinitionResults terms types _misses0 <- do
+              let nameSearch = NameSearch.makeNameSearch 10 absNames
+              runTransactionTimed "definitionsByName" codebase $
+                Backend.definitionsByName
+                  codebase
+                  nameSearch
+                  DontIncludeCycles
+                  ExactName
+                  (Set.singleton name)
+            let unbiasedPPED = PPED.makePPED (PPE.hqNamer 10 names) (PPE.suffixifyByHashName names)
+                pped = PPED.biasTo (maybeToList $ HQ.toName name) unbiasedPPED
+                renderedCodePretty =
+                  fromMaybe mempty $
+                    fst
+                      <$> renderCodePretty
+                        (const True)
+                        pped
+                        False
+                        (const False)
+                        terms
+                        types
+                        (Defns Set.empty Set.empty)
+                renderedCodeText = Pretty.toPlain 80 renderedCodePretty
+                renderedCodeByteString = encodeUtf8 renderedCodeText
+            Cache.insert readCache termOrTypeName renderedCodeByteString
+            pure renderedCodeByteString
+
   let readdir :: FilePath -> DirHandle -> IO (Either Errno [(String, Maybe FileStat)])
-      readdir fp (DirHandle _hash path) = do
+      readdir fp dirHandle = do
         debug ("readdir " <> fp)
-        listingBranch <- do
-          root <- getRoot codebase projectIds
-          runTransactionTimed "getShallowBranchAtPath" codebase $ getShallowBranchAtPath path =<< V2Causal.value root
-        listingEntries <- lsBranch codebase listingBranch
-        pure . Right . mapMaybe makeEntry $ listingEntries
+        Right <$> getListing dirHandle
 
       opendir :: FilePath -> IO (Either Errno DirHandle)
       opendir fp = do
@@ -272,29 +357,6 @@ makeFuseOperations codebase project = do
         debug ("releasedir " <> fp)
         -- nothing to do here
         pure eOK
-
-      getattr' :: FileOrDirHandle -> IO FileStat
-      getattr' fileOrDir = do
-        fileOwner <- getRealUserID
-        fileGroup <- getRealGroupID
-        now <- getTime Realtime
-        let fileID = fileOrDirID fileOrDir
-            (fileOrDirMode, fileSize) = case fileOrDir of
-              File {} -> (regularFileMode, 0)
-              Dir {} -> (directoryMode, 4096)
-            fileMode = foldl' unionFileModes fileOrDirMode [ownerReadMode, groupReadMode, otherReadMode]
-        pure
-          defaultFileStat
-            { fileMode,
-              fileID,
-              linkCount = 1,
-              fileOwner,
-              fileGroup,
-              fileSize,
-              accessTimeHiRes = now,
-              modificationTimeHiRes = now,
-              statusChangeTimeHiRes = now
-            }
 
       getattr :: FilePath -> Maybe FileHandle -> IO (Either Errno FileStat)
       getattr _ (Just fileHandle) = Right <$> getattr' (File fileHandle)
@@ -323,34 +385,9 @@ makeFuseOperations codebase project = do
             Right name -> getFileHandle codebase projectIds name >>= handleLookupResult
 
       read :: FilePath -> FileHandle -> ByteCount -> FileOffset -> IO (Either Errno ByteString)
-      read fp (FileHandle _ name) bytes offset = do
+      read fp fileHandle bytes offset = do
         debug ("read " <> fp)
-        names <- getRootNames codebase projectIds
-        let absNames = Names.makeAbsolute names
-        Backend.DefinitionResults terms types _misses0 <- do
-          let nameSearch = NameSearch.makeNameSearch 10 absNames
-          runTransactionTimed "definitionsByName" codebase $
-            Backend.definitionsByName
-              codebase
-              nameSearch
-              DontIncludeCycles
-              ExactName
-              (Set.singleton name)
-        let unbiasedPPED = PPED.makePPED (PPE.hqNamer 10 names) (PPE.suffixifyByHashName names)
-            pped = PPED.biasTo (maybeToList $ HQ.toName name) unbiasedPPED
-            renderedCodePretty =
-              fromMaybe mempty $
-                fst
-                  <$> renderCodePretty
-                    (const True)
-                    pped
-                    False
-                    (const False)
-                    terms
-                    types
-                    (Defns Set.empty Set.empty)
-            renderedCodeText = Pretty.toPlain 80 renderedCodePretty
-            renderedCodeByteString = encodeUtf8 renderedCodeText
+        renderedCodeByteString <- getRendered fileHandle
         pure $ Right $ BS.take (fromIntegral bytes) $ BS.drop (fromIntegral offset) renderedCodeByteString
 
       release :: FilePath -> FileHandle -> IO ()
