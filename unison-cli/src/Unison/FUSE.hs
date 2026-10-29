@@ -27,6 +27,7 @@ import Unison.Cli.ProjectUtils (justTheIds, justTheNames)
 import Unison.Codebase
   ( Codebase,
     expectProjectBranchRoot,
+    getBranchAtProjectPath,
     getShallowBranchAtPath,
     getShallowCausalAtPath,
     runTransaction,
@@ -34,7 +35,9 @@ import Unison.Codebase
 import Unison.Codebase.Branch.Names qualified as Branch
 import Unison.Codebase.Branch.Type qualified as Branch
 import Unison.Codebase.Editor.HandleInput.ShowDefinition (renderCodePretty)
-import Unison.Codebase.Path (Path, fromList)
+import Unison.Codebase.Path (Absolute (..), Path, fromList)
+import Unison.Codebase.Path qualified as Path
+import Unison.Codebase.ProjectPath qualified as PP
 import Unison.CommandLine.OutputMessages (renderFileName)
 import Unison.ConstructorReference (GConstructorReference (..))
 import Unison.Core.Project
@@ -42,8 +45,11 @@ import Unison.Debug (DebugFlag (..), debugM)
 import Unison.Hash (Hash (toShort))
 import Unison.HashQualified (HashQualified)
 import Unison.HashQualified qualified as HQ
+import Unison.HashQualifiedPrime qualified as HQ'
 import Unison.Name (Name)
+import Unison.Name qualified as Name
 import Unison.NameSegment (NameSegment)
+import Unison.NameSegment qualified as NameSegment
 import Unison.Names qualified as Names
 import Unison.NamesWithHistory (SearchType (..))
 import Unison.Parser.Ann (Ann)
@@ -60,8 +66,7 @@ import Unison.Server.SearchResult (SearchResult (..), TermResult (..), TypeResul
 import Unison.Server.SearchResult qualified as SearchResult
 import Unison.Sqlite (Transaction)
 import Unison.Symbol (Symbol)
-import Unison.Syntax.HashQualified qualified as HQ
-import Unison.Syntax.Name qualified as Name (toText)
+import Unison.Syntax.Name qualified as Name (parseText, toText)
 import Unison.Syntax.NameSegment qualified as NameSegment
 import Unison.Util.Cache qualified as Cache
 import Unison.Util.Defns (Defns (..))
@@ -72,13 +77,13 @@ import Unison.Util.Pretty qualified as Pretty
 data TermOrTypeName = BuiltinName (HashQualified Name) | Hash Hash
   deriving (Show, Eq, Ord)
 
-data FileHandle = FileHandle TermOrTypeName (HashQualified Name)
+data FileHandle = FileHandle TermOrTypeName Name
   deriving (Show)
 
 data DirHandle = DirHandle Hash Path
   deriving (Show)
 
-data FileOrDirName = FileName (HashQualified Name) | DirName Path
+data FileOrDirName = FileName Name | DirName Path
   deriving (Show)
 
 data FileOrDirHash = BuiltinTermOrType (HashQualified Name) | FileOrDirHash Hash
@@ -89,6 +94,11 @@ fileOrDirHash = \case
   File (FileHandle (BuiltinName hq) _) -> BuiltinTermOrType hq
   File (FileHandle (Hash hash) _) -> FileOrDirHash hash
   Dir (DirHandle hash _) -> FileOrDirHash hash
+
+fileOrDirName :: FileOrDirHandle -> FileOrDirName
+fileOrDirName = \case
+  File (FileHandle _ name) -> FileName name
+  Dir (DirHandle _ path) -> DirName path
 
 data FileOrDirHandle
   = File FileHandle
@@ -103,13 +113,13 @@ data LookupResult a
 
 -- Parsing
 
-parseFileName :: Text -> Either Text (HashQualified Name)
+parseFileName :: Text -> Either Text Name
 parseFileName fileName = do
   let err =
         fileName
           <> " is not a well-formed name, hash, or hash-qualified name. "
           <> "I expected something like `foo`, `#abc123`, or `foo#abc123`."
-  maybeToEither err (HQ.parseText ("." <> T.replace "/" "." (T.dropAround (`elem` pathSeparators) fileName)))
+  maybeToEither err (Name.parseText ("." <> T.replace "/" "." (T.dropAround (`elem` pathSeparators) fileName)))
 
 filePathToPath :: FilePath -> Either Text Path
 filePathToPath ('/' : rel) =
@@ -162,26 +172,49 @@ makeDirName name = T.unpack $ NameSegment.toEscapedText name
 
 getFileHandle ::
   Codebase IO Symbol Ann ->
-  ProjectAndBranch ProjectId ProjectBranchId ->
-  HashQualified Name ->
+  ProjectAndBranch Project ProjectBranch ->
+  Name ->
   IO (LookupResult FileHandle)
-getFileHandle codebase project name = do
-  names <- Names.makeAbsolute <$> getRootNames codebase project
-  let nameSearch = NameSearch.makeNameSearch 10 names
+getFileHandle codebase project searchName = do
+  let parent = Name.parent searchName
+      lastSeg = Name.lastSegment searchName
 
-  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton name)
-  let hits = filter ((== name) . SearchResult.name) hits0
+  mSearch <- case parent of
+    Nothing -> pure Nothing
+    Just namespace -> do
+      let path = Path.fromName namespace
+      getNamespaceNames codebase project path >>= \case
+        Just names -> pure $ Just (names, Name.fromSegment lastSeg)
+        Nothing -> pure Nothing
+
+  (names, name) <- case mSearch of
+    Just search ->
+      pure search
+    Nothing -> do
+      names <- Names.makeAbsolute <$> getRootNames codebase (justTheIds project)
+      pure (names, searchName)
+
+  let hqName = HQ.NameOnly name
+  let nameSearch = NameSearch.makeNameSearch 64 names
+
+  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton hqName)
+  let hits =
+        [ hit
+        | hit <- hits0,
+          SearchResult.name hit == hqName
+            || hqName `elem` fmap HQ'.toHQ (Set.toList $ SearchResult.aliases hit)
+        ]
 
   case hits of
     [one] -> do
       let fromRef = \case
             ReferenceDerived (Id hsh _) -> Hash hsh
-            ReferenceBuiltin _ -> BuiltinName name
+            ReferenceBuiltin _ -> BuiltinName hqName
       case one of
-        Tp tyRes -> pure $ Found $ FileHandle (fromRef $ reference tyRes) name
+        Tp tyRes -> pure $ Found $ FileHandle (fromRef $ reference tyRes) searchName
         Tm tmRes -> case referent tmRes of
-          Ref' ref -> pure $ Found $ FileHandle (fromRef ref) name
-          Con' (ConstructorReference ref _) _ -> pure $ Found $ FileHandle (fromRef ref) name
+          Ref' ref -> pure $ Found $ FileHandle (fromRef ref) searchName
+          Con' (ConstructorReference ref _) _ -> pure $ Found $ FileHandle (fromRef ref) searchName
     [] -> pure NotFound
     _many -> pure $ LookupError "Ambiguous search"
 
@@ -212,7 +245,7 @@ getFileOrDirHandle ::
   IO (LookupResult FileOrDirHandle)
 getFileOrDirHandle codebase project fp = case parseFileOrDirName fp of
   Left err -> pure $ LookupError err
-  Right (FileName hqName) -> fmap File <$> getFileHandle codebase (justTheIds project) hqName
+  Right (FileName hqName) -> fmap File <$> getFileHandle codebase project hqName
   Right (DirName path) -> fmap Dir <$> getDirHandle codebase (justTheIds project) path
 
 handleLookupResult ::
@@ -247,6 +280,15 @@ getRootNames ::
 getRootNames codebase project = do
   branch <- expectProjectBranchRoot codebase project.project project.branch
   pure . Branch.toNames . Branch.head $ branch
+
+getNamespaceNames ::
+  (MonadIO m) =>
+  Codebase m Symbol Ann ->
+  ProjectAndBranch Project ProjectBranch ->
+  Path ->
+  m (Maybe Names.Names)
+getNamespaceNames codebase (ProjectAndBranch project branch) path =
+  fmap (Branch.toNames . Branch.head) <$> getBranchAtProjectPath codebase (PP.ProjectPath project branch (Absolute path))
 
 -- main
 
@@ -319,9 +361,10 @@ makeFuseOperations codebase project = do
                   nameSearch
                   DontIncludeCycles
                   ExactName
-                  (Set.singleton name)
+                  (Set.singleton (HQ.NameOnly name))
+
             let unbiasedPPED = PPED.makePPED (PPE.hqNamer 10 names) (PPE.suffixifyByHashName names)
-                pped = PPED.biasTo (maybeToList $ HQ.toName name) unbiasedPPED
+                pped = PPED.biasTo [name] unbiasedPPED
                 renderedCodePretty =
                   fromMaybe mempty $
                     fst
@@ -382,7 +425,7 @@ makeFuseOperations codebase project = do
             Left err -> do
               debug (T.unpack err)
               pure $ Left eNOENT
-            Right name -> getFileHandle codebase projectIds name >>= handleLookupResult
+            Right name -> getFileHandle codebase project name >>= handleLookupResult
 
       read :: FilePath -> FileHandle -> ByteCount -> FileOffset -> IO (Either Errno ByteString)
       read fp fileHandle bytes offset = do
