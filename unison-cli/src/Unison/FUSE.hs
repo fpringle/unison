@@ -3,12 +3,13 @@ module Unison.FUSE where
 import Data.ByteString qualified as BS
 import Data.ByteString.Short (fromShort)
 import Data.Digest.Murmur64 (asWord64, hash64)
+import Data.List (sort)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Foreign.C.Error (Errno, eNOENT, eOK, ePERM)
 import System.Clock (Clock (Realtime), getTime)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, makeAbsolute)
-import System.FilePath (addExtension, pathSeparators, splitExtension, splitPath)
+import System.FilePath (addExtension, pathSeparators, splitPath)
 import System.LibFuse3
 import System.LibFuse3.FuseConfig (FuseConfig (..))
 import System.LibFuse3.Internal (fuseRun)
@@ -71,33 +72,31 @@ import Unison.Syntax.NameSegment qualified as NameSegment
 import Unison.Util.Cache qualified as Cache
 import Unison.Util.Defns (Defns (..))
 import Unison.Util.Pretty qualified as Pretty
+import Unison.Util.Relation qualified as R
 
 -- Types
 
 data TermOrTypeName = BuiltinName (HashQualified Name) | Hash Hash
   deriving (Show, Eq, Ord)
 
-data FileHandle = FileHandle TermOrTypeName Name
+data Expanded = DefnOnly | WithNamespace
+  deriving (Show, Eq, Ord)
+
+data FileHandle
+  = FileHandle TermOrTypeName Name
+  | NamespaceHandle Hash Path
   deriving (Show)
 
 data DirHandle = DirHandle Hash Path
   deriving (Show)
 
-data FileOrDirName = FileName Name | DirName Path
-  deriving (Show)
-
-data FileOrDirHash = BuiltinTermOrType (HashQualified Name) | FileOrDirHash Hash
+data FileOrDirName = FileName FileExpanded | DirName Path
   deriving (Show, Eq, Ord)
-
-fileOrDirHash :: FileOrDirHandle -> FileOrDirHash
-fileOrDirHash = \case
-  File (FileHandle (BuiltinName hq) _) -> BuiltinTermOrType hq
-  File (FileHandle (Hash hash) _) -> FileOrDirHash hash
-  Dir (DirHandle hash _) -> FileOrDirHash hash
 
 fileOrDirName :: FileOrDirHandle -> FileOrDirName
 fileOrDirName = \case
-  File (FileHandle _ name) -> FileName name
+  File (FileHandle _ name) -> FileName (DefnFile name)
+  File (NamespaceHandle _ path) -> FileName (NamespaceFile path)
   Dir (DirHandle _ path) -> DirName path
 
 data FileOrDirHandle
@@ -109,9 +108,24 @@ data LookupResult a
   = Found a
   | NotFound
   | LookupError Text
-  deriving (Functor)
+  deriving (Show, Functor)
+
+data FileExpanded
+  = DefnFile Name
+  | NamespaceFile Path
+  deriving (Show, Eq, Ord)
 
 -- Parsing
+
+splitExpandedExtension :: Text -> Maybe (Text, Expanded)
+splitExpandedExtension fp = trySuffix WithNamespace "@namespace.u" <|> trySuffix DefnOnly ".u"
+  where
+    trySuffix extended suffix = (,extended) <$> T.stripSuffix suffix fp
+
+parseFileNameU :: FilePath -> Either Text FileExpanded
+parseFileNameU (T.pack -> fp) = case splitExpandedExtension fp of
+  Just (fileName, expanded) -> parseFileExpanded expanded fileName
+  Nothing -> Left $ "Invalid file name: " <> fp
 
 parseFileName :: Text -> Either Text Name
 parseFileName fileName = do
@@ -120,6 +134,10 @@ parseFileName fileName = do
           <> " is not a well-formed name, hash, or hash-qualified name. "
           <> "I expected something like `foo`, `#abc123`, or `foo#abc123`."
   maybeToEither err (Name.parseText ("." <> T.replace "/" "." (T.dropAround (`elem` pathSeparators) fileName)))
+
+parseFileExpanded :: Expanded -> Text -> Either Text FileExpanded
+parseFileExpanded DefnOnly fileName = DefnFile <$> parseFileName fileName
+parseFileExpanded WithNamespace fileName = NamespaceFile <$> filePathToPath (T.unpack fileName)
 
 filePathToPath :: FilePath -> Either Text Path
 filePathToPath ('/' : rel) =
@@ -133,9 +151,9 @@ filePathToPath ('/' : rel) =
 filePathToPath rel = Left . T.pack $ "Relative path: " <> rel
 
 parseFileOrDirName :: FilePath -> Either Text FileOrDirName
-parseFileOrDirName fp = case splitExtension fp of
-  (fileName, ".u") -> FileName <$> parseFileName (T.pack fileName)
-  _ -> DirName <$> filePathToPath fp
+parseFileOrDirName fp = case splitExpandedExtension (T.pack fp) of
+  Just (fileName, expanded) -> FileName <$> parseFileExpanded expanded fileName
+  Nothing -> DirName <$> filePathToPath fp
 
 -- Output
 
@@ -144,6 +162,7 @@ fileOrDirID :: FileOrDirHandle -> FileID
 fileOrDirID = \case
   File (FileHandle (BuiltinName builtinName) _) -> onName builtinName
   File (FileHandle (Hash hash) _) -> onHash hash
+  File (NamespaceHandle hash _) -> onHash hash
   Dir (DirHandle hash _) -> onHash hash
   where
     onHash :: Hash -> FileID
@@ -152,18 +171,33 @@ fileOrDirID = \case
     onName :: HashQualified Name -> FileID
     onName = CIno . asWord64 . hash64 . encodeUtf8 . HQ.toTextWith Name.toText
 
-makeEntry :: ShallowListEntry Symbol Ann -> Maybe (String, Maybe FileStat)
-makeEntry = \case
-  ShallowTermEntry te ->
-    Just (makeFileName (termEntryName te), Nothing)
-  ShallowTypeEntry te ->
-    Just (makeFileName (typeEntryName te), Nothing)
-  ShallowBranchEntry name _hash _stats ->
-    Just (makeDirName name, Nothing)
-  ShallowPatchEntry _name -> Nothing -- no idea what this is
+makeEntries :: Path -> [ShallowListEntry Symbol Ann] -> [(String, Maybe FileStat)]
+makeEntries path list =
+  let sep = \case
+        ShallowTermEntry te ->
+          Just (Right (termEntryName te))
+        ShallowTypeEntry te ->
+          Just (Right (typeEntryName te))
+        ShallowBranchEntry name _hash _stats ->
+          Just (Left name)
+        _ -> Nothing
+      (branches, defns) = partitionEithers $ mapMaybe sep list
 
-makeFileName :: Name -> String
-makeFileName name = addExtension (T.unpack (Name.toText name)) ".u"
+      normal = fmap (makeFileName DefnOnly . Path.fromName) defns <> fmap makeDirName branches
+      withNamespaceFile =
+        -- this is so that there isn't a @namespace.u in the root directory,
+        -- which would contain everything from all dependencies and would be gargantuan
+        if Path.isRoot (Absolute path)
+          then normal
+          else makeFileName WithNamespace path : normal
+
+      sorted = sort withNamespaceFile
+   in (,Nothing) <$> sorted
+
+makeFileName :: Expanded -> Path -> String
+makeFileName DefnOnly name =
+  addExtension (T.unpack (Path.toText name)) ".u"
+makeFileName WithNamespace _ = "@namespace.u"
 
 makeDirName :: NameSegment -> String
 makeDirName name = T.unpack $ NameSegment.toEscapedText name
@@ -173,9 +207,12 @@ makeDirName name = T.unpack $ NameSegment.toEscapedText name
 getFileHandle ::
   Codebase IO Symbol Ann ->
   ProjectAndBranch Project ProjectBranch ->
-  Name ->
+  FileExpanded ->
   IO (LookupResult FileHandle)
-getFileHandle codebase project searchName = do
+getFileHandle codebase project (NamespaceFile path) = do
+  dirHandleRes <- getDirHandle codebase (justTheIds project) path
+  pure $ dirHandleRes <&> (\(DirHandle hash path) -> NamespaceHandle hash path)
+getFileHandle codebase project (DefnFile searchName) = do
   let parent = Name.parent searchName
       lastSeg = Name.lastSegment searchName
 
@@ -210,11 +247,11 @@ getFileHandle codebase project searchName = do
       let fromRef = \case
             ReferenceDerived (Id hsh _) -> Hash hsh
             ReferenceBuiltin _ -> BuiltinName hqName
-      case one of
-        Tp tyRes -> pure $ Found $ FileHandle (fromRef $ reference tyRes) searchName
+      pure $ Found $ case one of
+        Tp tyRes -> FileHandle (fromRef $ reference tyRes) searchName
         Tm tmRes -> case referent tmRes of
-          Ref' ref -> pure $ Found $ FileHandle (fromRef ref) searchName
-          Con' (ConstructorReference ref _) _ -> pure $ Found $ FileHandle (fromRef ref) searchName
+          Ref' ref -> FileHandle (fromRef ref) searchName
+          Con' (ConstructorReference ref _) _ -> FileHandle (fromRef ref) searchName
     [] -> pure NotFound
     _many -> pure $ LookupError "Ambiguous search"
 
@@ -311,14 +348,14 @@ makeFuseOperations codebase project = do
               root <- getRoot codebase projectIds
               runTransactionTimed "getShallowBranchAtPath" codebase $ getShallowBranchAtPath path =<< V2Causal.value root
             listingEntries <- lsBranch codebase listingBranch
-            let entries = mapMaybe makeEntry $ listingEntries
+            let entries = makeEntries path listingEntries
             Cache.insert listingCache hash entries
             pure entries
 
-  attrCache :: Cache.Cache FileOrDirHash FileStat <- Cache.semispaceCache 8192
+  attrCache :: Cache.Cache FileOrDirName FileStat <- Cache.semispaceCache 8192
   let getattr' :: FileOrDirHandle -> IO FileStat
       getattr' fileOrDir = do
-        let hash = fileOrDirHash fileOrDir
+        let hash = fileOrDirName fileOrDir
         Cache.lookup attrCache hash >>= \case
           Just attr -> pure attr
           Nothing -> do
@@ -345,26 +382,45 @@ makeFuseOperations codebase project = do
             Cache.insert attrCache hash attr
             pure attr
 
-  readCache :: Cache.Cache TermOrTypeName ByteString <- Cache.semispaceCache 8192
+  readCache :: Cache.Cache (TermOrTypeName, Expanded) ByteString <- Cache.semispaceCache 8192
   let getRendered :: FileHandle -> IO ByteString
-      getRendered (FileHandle termOrTypeName name) =
-        Cache.lookup readCache termOrTypeName >>= \case
+      getRendered fileHandle = do
+        let (termOrTypeName, extended, mName, path) = case fileHandle of
+              FileHandle termOrTypeName name -> (termOrTypeName, DefnOnly, Just name, Path.fromName name)
+              NamespaceHandle hash path -> (Hash hash, WithNamespace, Path.toName path, path)
+
+        Cache.lookup readCache (termOrTypeName, extended) >>= \case
           Just v -> pure v
           Nothing -> do
             names <- getRootNames codebase projectIds
             let absNames = Names.makeAbsolute names
             Backend.DefinitionResults terms types _misses0 <- do
               let nameSearch = NameSearch.makeNameSearch 10 absNames
+                  baseNames = case mName of
+                    Nothing -> Set.empty
+                    Just name -> Set.fromList [HQ.NameOnly name, HQ.NameOnly (Name.snoc name NameSegment.docSegment)]
+              namesToSearch <-
+                case extended of
+                  WithNamespace ->
+                    getNamespaceNames codebase project path >>= \case
+                      Nothing -> pure baseNames
+                      Just (Names.Names tms tys) -> do
+                        let names' = R.dom tms <> R.dom tys
+                            allAbsNames = Set.map Name.makeAbsolute $ case mName of
+                              Nothing -> names'
+                              Just name -> Set.insert name $ Set.map (Name.joinDot name) names'
+                        pure . Set.map HQ.NameOnly $ allAbsNames
+                  DefnOnly -> pure baseNames
               runTransactionTimed "definitionsByName" codebase $
                 Backend.definitionsByName
                   codebase
                   nameSearch
                   DontIncludeCycles
                   ExactName
-                  (Set.fromList [HQ.NameOnly name, HQ.NameOnly (Name.snoc name NameSegment.docSegment)])
+                  namesToSearch
 
             let unbiasedPPED = PPED.makePPED (PPE.hqNamer 10 names) (PPE.suffixifyByHashName names)
-                pped = PPED.biasTo [name] unbiasedPPED
+                pped = PPED.biasTo (maybeToList mName) unbiasedPPED
                 renderedCodePretty =
                   fromMaybe mempty $
                     fst
@@ -378,7 +434,7 @@ makeFuseOperations codebase project = do
                         (Defns Set.empty Set.empty)
                 renderedCodeText = Pretty.toPlain 80 renderedCodePretty
                 renderedCodeByteString = encodeUtf8 renderedCodeText
-            Cache.insert readCache termOrTypeName renderedCodeByteString
+            Cache.insert readCache (termOrTypeName, extended) renderedCodeByteString
             pure renderedCodeByteString
 
   let readdir :: FilePath -> DirHandle -> IO (Either Errno [(String, Maybe FileStat)])
@@ -417,15 +473,11 @@ makeFuseOperations codebase project = do
       open :: FilePath -> OpenMode -> OpenFileFlags -> IO (Either Errno FileHandle)
       open fp mode flags = do
         debug ("open " <> fp <> " " <> show mode <> " " <> show flags)
-        case T.stripSuffix ".u" (T.pack fp) of
-          Nothing -> do
-            debug $ "Invalid file name: " <> fp
+        case parseFileNameU fp of
+          Left err -> do
+            debug (T.unpack err)
             pure $ Left eNOENT
-          Just fileName -> case parseFileName fileName of
-            Left err -> do
-              debug (T.unpack err)
-              pure $ Left eNOENT
-            Right name -> getFileHandle codebase project name >>= handleLookupResult
+          Right name -> getFileHandle codebase project name >>= handleLookupResult
 
       read :: FilePath -> FileHandle -> ByteCount -> FileOffset -> IO (Either Errno ByteString)
       read fp fileHandle bytes offset = do
