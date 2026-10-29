@@ -60,6 +60,7 @@ module Unison.Codebase
     getShallowBranchAtPath,
     getMaybeShallowBranchAtPath,
     getShallowCausalAtPath,
+    getShallowCausalAtPathMaybe,
     Operations.expectCausalBranchByCausalHash,
     getShallowCausalAtPathFromRootHash,
     getShallowProjectBranchRoot,
@@ -223,6 +224,16 @@ getShallowCausalAtPath ::
 getShallowCausalAtPath = cata \case
   Neither -> pure
   Both ns fn -> maybe (pure $ Cv.causalbranch1to2 Branch.empty) fn . V2Branch.childAt ns <=< V2Causal.value
+
+-- | Recursively descend into causals following the given path,
+-- Return Nothing if the path doesn't exist
+getShallowCausalAtPathMaybe ::
+  Path ->
+  (V2Branch.CausalBranch Sqlite.Transaction) ->
+  Sqlite.Transaction (Maybe (V2Branch.CausalBranch Sqlite.Transaction))
+getShallowCausalAtPathMaybe = cata \case
+  Neither -> pure . Just
+  Both ns fn -> fmap join . traverse fn . V2Branch.childAt ns <=< V2Causal.value
 
 -- | Recursively descend into causals following the given path,
 -- Use the root causal if none is provided.

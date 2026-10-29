@@ -30,7 +30,7 @@ import Unison.Codebase
     expectProjectBranchRoot,
     getBranchAtProjectPath,
     getShallowBranchAtPath,
-    getShallowCausalAtPath,
+    getShallowCausalAtPathMaybe,
     runTransaction,
   )
 import Unison.Codebase.Branch.Names qualified as Branch
@@ -270,10 +270,13 @@ getDirHandle ::
   Path ->
   IO (LookupResult DirHandle)
 getDirHandle codebase project path = do
-  listingCausal <-
-    getRoot codebase project >>= runTransactionTimed "getShallowCausalAtPath" codebase . getShallowCausalAtPath path
-  let hash = unCausalHash $ V2Causal.causalHash listingCausal
-  pure . Found $ DirHandle hash path
+  getRoot codebase project
+    >>= runTransactionTimed "getShallowCausalAtPathMaybe" codebase . getShallowCausalAtPathMaybe path
+    >>= \case
+      Nothing -> pure NotFound
+      Just listingCausal -> do
+        let hash = unCausalHash $ V2Causal.causalHash listingCausal
+        pure . Found $ DirHandle hash path
 
 getFileOrDirHandle ::
   Codebase IO Symbol Ann ->
