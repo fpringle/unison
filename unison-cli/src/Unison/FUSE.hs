@@ -10,6 +10,7 @@ import Foreign.C.Error (Errno, eNOENT, eOK, ePERM)
 import System.Clock (Clock (Realtime), getTime)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, makeAbsolute)
 import System.FilePath (addExtension, pathSeparators, splitPath)
+import System.Info (os)
 import System.LibFuse3
 import System.LibFuse3.FuseConfig (FuseConfig (..))
 import System.LibFuse3.Internal (fuseRun)
@@ -39,7 +40,7 @@ import Unison.Codebase.Editor.HandleInput.ShowDefinition (renderCodePretty)
 import Unison.Codebase.Path (Absolute (..), Path, fromList)
 import Unison.Codebase.Path qualified as Path
 import Unison.Codebase.ProjectPath qualified as PP
-import Unison.CommandLine.OutputMessages (renderFileName)
+import Unison.CommandLine.OutputMessages (oxfordOr, renderFileName)
 import Unison.ConstructorReference (GConstructorReference (..))
 import Unison.Core.Project
 import Unison.Debug (DebugFlag (..), debugM)
@@ -71,6 +72,7 @@ import Unison.Syntax.Name qualified as Name (parseText, toText)
 import Unison.Syntax.NameSegment qualified as NameSegment
 import Unison.Util.Cache qualified as Cache
 import Unison.Util.Defns (Defns (..))
+import Unison.Util.Pretty qualified as P
 import Unison.Util.Pretty qualified as Pretty
 import Unison.Util.Relation qualified as R
 
@@ -554,6 +556,12 @@ fuseMain progName codebase project mountPoint = do
   fuseOps <- makeFuseOperations codebase project
   absMountPoint <- makeAbsolute mountPoint
   prettyMountPoint <- renderFileName absMountPoint
+
+  case os of
+    "darwin" -> PT.putPrettyLn macWarning
+    "mingw32" -> PT.putPrettyLn windowsWarning
+    _ -> pure ()
+
   unlessM (doesDirectoryExist absMountPoint) do
     PT.putPrettyLn $
       "Creating directory "
@@ -572,6 +580,20 @@ fuseMain progName codebase project mountPoint = do
           absMountPoint
         ]
   fuseRun progName fuseArgs fuseOps defaultExceptionHandler
+  where
+    makeWarning platform tools =
+      P.lines
+        [ "It looks like you're running UCM on " <> P.green platform <> ".",
+          "The "
+            <> P.bold "mount"
+            <> " command uses the "
+            <> P.blue "FUSE3"
+            <> " library, which is not natively supported on your platform.",
+          "Please make sure you have a package like " <> oxfordOr (P.bold <$> tools) <> " installed."
+        ]
+
+    macWarning = makeWarning "MacOS" ["macFuse"]
+    windowsWarning = makeWarning "Windows" ["winfsp"]
 
 debug :: String -> IO ()
 -- debug = debugLogM Temp

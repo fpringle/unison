@@ -606,14 +606,15 @@ notifyNumbered = \case
     )
   where
     absPathToBranchId = BranchAtPath
-    -- Like oxfordCommas but uses "or" instead of "and", without extra spaces.
-    -- Groups each element with its trailing comma to prevent line breaks between them.
-    oxfordOr :: [P.Pretty P.ColorText] -> P.Pretty P.ColorText
-    oxfordOr = \case
-      [] -> ""
-      [x] -> x
-      [x, y] -> x <> " or " <> y
-      xs -> P.spaced (P.group . (<> ",") <$> init xs) <> P.softbreak <> "or " <> last xs
+
+-- Like oxfordCommas but uses "or" instead of "and", without extra spaces.
+-- Groups each element with its trailing comma to prevent line breaks between them.
+oxfordOr :: [P.Pretty P.ColorText] -> P.Pretty P.ColorText
+oxfordOr = \case
+  [] -> ""
+  [x] -> x
+  [x, y] -> x <> " or " <> y
+  xs -> P.spaced (P.group . (<> ",") <$> init xs) <> P.softbreak <> "or " <> last xs
 
 undoTip :: P.Pretty P.ColorText
 undoTip =
