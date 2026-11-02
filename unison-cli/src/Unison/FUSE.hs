@@ -4,6 +4,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Short (fromShort)
 import Data.Digest.Murmur64 (asWord64, hash64)
 import Data.List (sort)
+import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Foreign.C.Error (Errno, eNOENT, eOK, ePERM)
@@ -209,34 +210,34 @@ makeDirName name = T.unpack $ NameSegment.toEscapedText name
 getFileHandle ::
   Codebase IO Symbol Ann ->
   ProjectAndBranch Project ProjectBranch ->
+  Names.Names ->
   FileExpanded ->
   IO (LookupResult FileHandle)
-getFileHandle codebase project (NamespaceFile path) = do
+getFileHandle codebase project _ (NamespaceFile path) = do
   dirHandleRes <- getDirHandle codebase (justTheIds project) path
   pure $ dirHandleRes <&> (\(DirHandle hash path) -> NamespaceHandle hash path)
-getFileHandle codebase project (DefnFile searchName) = do
+getFileHandle codebase project rootNames (DefnFile searchName) = do
   let parent = Name.parent searchName
       lastSeg = Name.lastSegment searchName
 
-  mSearch <- case parent of
-    Nothing -> pure Nothing
+  (names, name) <- case parent of
+    Nothing -> do
+      let isTopLevel :: Name -> Bool
+          isTopLevel name = case Name.segments name of
+            _ :| [] -> True
+            _ -> False
+          names = Names.filter isTopLevel $ Names.makeAbsolute rootNames
+      pure (names, searchName)
     Just namespace -> do
       let path = Path.fromName namespace
       getNamespaceNames codebase project path >>= \case
-        Just names -> pure $ Just (names, Name.fromSegment lastSeg)
-        Nothing -> pure Nothing
-
-  (names, name) <- case mSearch of
-    Just search ->
-      pure search
-    Nothing -> do
-      names <- Names.makeAbsolute <$> getRootNames codebase (justTheIds project)
-      pure (names, searchName)
+        Just names -> pure (names, Name.fromSegment lastSeg)
+        Nothing -> pure (Names.makeAbsolute rootNames, searchName)
 
   let hqName = HQ.NameOnly name
-  let nameSearch = NameSearch.makeNameSearch 64 names
+  let nameSearch = NameSearch.makeNameSearch 10 names
 
-  QueryResult _ hits0 <- runTransactionTimed "hqNameQuery" codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton hqName)
+  QueryResult _ hits0 <- runTransactionTimed ("hqNameQuery " <> Name.toText name) codebase $ hqNameQuery codebase nameSearch ExactName (Set.singleton hqName)
   let hits =
         [ hit
         | hit <- hits0,
@@ -257,14 +258,18 @@ getFileHandle codebase project (DefnFile searchName) = do
     [] -> pure NotFound
     _many -> pure $ LookupError "Ambiguous search"
 
+timed :: (MonadIO m) => Text -> m b -> m b
+timed _label action = do
+  -- start <- liftIO getCurrentTime
+  res <- action
+  -- end <- liftIO getCurrentTime
+  -- liftIO $ hPutStrLn stderr $ T.unpack label <> " took " <> show (diffUTCTime end start)
+  pure res
+
 -- | Useful for debugging bottlenecks. Un-comment the lines below to print timings.
 runTransactionTimed :: (MonadIO m) => Text -> Codebase m v a -> Transaction b -> m b
-runTransactionTimed _label codebase transaction = do
-  -- start <- liftIO getCurrentTime
-  res <- runTransaction codebase transaction
-  -- end <- liftIO getCurrentTime
-  -- liftIO $ putStrLn $ T.unpack label <> " took " <> show (diffUTCTime end start)
-  pure res
+runTransactionTimed label codebase transaction =
+  timed label $ runTransaction codebase transaction
 
 getDirHandle ::
   Codebase IO Symbol Ann ->
@@ -283,11 +288,12 @@ getDirHandle codebase project path = do
 getFileOrDirHandle ::
   Codebase IO Symbol Ann ->
   ProjectAndBranch Project ProjectBranch ->
+  Names.Names ->
   FilePath ->
   IO (LookupResult FileOrDirHandle)
-getFileOrDirHandle codebase project fp = case parseFileOrDirName fp of
+getFileOrDirHandle codebase project rootNames fp = case parseFileOrDirName fp of
   Left err -> pure $ LookupError err
-  Right (FileName hqName) -> fmap File <$> getFileHandle codebase project hqName
+  Right (FileName hqName) -> fmap File <$> getFileHandle codebase project rootNames hqName
   Right (DirName path) -> fmap Dir <$> getDirHandle codebase (justTheIds project) path
 
 handleLookupResult ::
@@ -320,7 +326,7 @@ getRootNames ::
   ProjectAndBranch ProjectId ProjectBranchId ->
   m Names.Names
 getRootNames codebase project = do
-  branch <- expectProjectBranchRoot codebase project.project project.branch
+  branch <- timed "expectProjectBranchRoot" $ expectProjectBranchRoot codebase project.project project.branch
   pure . Branch.toNames . Branch.head $ branch
 
 getNamespaceNames ::
@@ -330,7 +336,7 @@ getNamespaceNames ::
   Path ->
   m (Maybe Names.Names)
 getNamespaceNames codebase (ProjectAndBranch project branch) path =
-  fmap (Branch.toNames . Branch.head) <$> getBranchAtProjectPath codebase (PP.ProjectPath project branch (Absolute path))
+  timed "getBranchAtProjectPath" $ fmap (Branch.toNames . Branch.head) <$> getBranchAtProjectPath codebase (PP.ProjectPath project branch (Absolute path))
 
 -- main
 
@@ -342,6 +348,7 @@ makeFuseOperations ::
   IO (FuseOperations FileHandle DirHandle)
 makeFuseOperations codebase project = do
   let projectIds = justTheIds project
+  rootNames <- getRootNames codebase projectIds
 
   listingCache :: Cache.Cache Hash [(String, Maybe FileStat)] <- Cache.semispaceCache 1024
   let getListing :: DirHandle -> IO [(String, Maybe FileStat)]
@@ -397,7 +404,7 @@ makeFuseOperations codebase project = do
         Cache.lookup readCache (termOrTypeName, extended) >>= \case
           Just v -> pure v
           Nothing -> do
-            names <- getRootNames codebase projectIds
+            let names = rootNames
             let absNames = Names.makeAbsolute names
             Backend.DefinitionResults terms types _misses0 <- do
               let nameSearch = NameSearch.makeNameSearch 10 absNames
@@ -410,6 +417,7 @@ makeFuseOperations codebase project = do
                     getNamespaceNames codebase project path >>= \case
                       Nothing -> pure baseNames
                       Just (Names.Names tms tys) -> do
+                        -- TODO: limit?
                         let names' = R.dom tms <> R.dom tys
                             allAbsNames = Set.map Name.makeAbsolute $ case mName of
                               Nothing -> names'
@@ -466,7 +474,7 @@ makeFuseOperations codebase project = do
       getattr _ (Just fileHandle) = Right <$> getattr' (File fileHandle)
       getattr fp _ = do
         debug ("getattr " <> fp)
-        getFileOrDirHandle codebase project fp >>= \case
+        getFileOrDirHandle codebase project rootNames fp >>= \case
           NotFound -> do
             debug "No such file or directory"
             pure $ Left eNOENT
@@ -482,7 +490,7 @@ makeFuseOperations codebase project = do
           Left err -> do
             debug (T.unpack err)
             pure $ Left eNOENT
-          Right name -> getFileHandle codebase project name >>= handleLookupResult
+          Right name -> getFileHandle codebase project rootNames name >>= handleLookupResult
 
       read :: FilePath -> FileHandle -> ByteCount -> FileOffset -> IO (Either Errno ByteString)
       read fp fileHandle bytes offset = do
@@ -500,7 +508,7 @@ makeFuseOperations codebase project = do
       access fp mode = do
         debug ("access " <> fp <> " " <> show mode)
         let checkFile = do
-              lookup <- getFileOrDirHandle codebase project fp >>= handleLookupResult
+              lookup <- getFileOrDirHandle codebase project rootNames fp >>= handleLookupResult
               pure $ case lookup of
                 Left err -> err
                 Right _ -> eOK
